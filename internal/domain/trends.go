@@ -1,9 +1,14 @@
-package model
+package domain
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 	"time"
+)
+
+var (
+	ErrEmptyQuery   = errors.New("empty query")
+	ErrInvalidEvent = errors.New("invalid event")
 )
 
 type SearchEvent struct {
@@ -15,29 +20,35 @@ type SearchEvent struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
-type TopItem struct {
-	Query string `json:"query"`
-	Count int    `json:"count"`
+type TrendEntry struct {
+	Query string
+	Count int
 }
 
-type TopResponse struct {
-	WindowSeconds int       `json:"window_seconds"`
-	Limit         int       `json:"limit"`
-	Items         []TopItem `json:"items"`
-}
-
-type StopWord struct {
-	Word string `json:"word"`
+type IngestResult struct {
+	Accepted bool
+	Reason   string
 }
 
 func NormalizeQuery(value string) (string, error) {
 	trimmed := strings.TrimSpace(strings.ToLower(value))
 	if trimmed == "" {
-		return "", fmt.Errorf("query is empty")
+		return "", ErrEmptyQuery
 	}
 	fields := strings.Fields(trimmed)
 	if len(fields) == 0 {
-		return "", fmt.Errorf("query is empty")
+		return "", ErrEmptyQuery
 	}
 	return strings.Join(fields, " "), nil
+}
+
+func ValidateEvent(event SearchEvent) error {
+	if event.EventID == "" || event.SessionID == "" || event.OccurredAt.IsZero() {
+		return ErrInvalidEvent
+	}
+	_, err := NormalizeQuery(event.Query)
+	if err != nil {
+		return err
+	}
+	return nil
 }

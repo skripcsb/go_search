@@ -8,48 +8,54 @@ import (
 	"net/http"
 	"time"
 
-	"searchtrends/internal/broker"
+	"searchtrends/internal/adapter/httpapi"
+	"searchtrends/internal/adapter/kafka"
+	"searchtrends/internal/application/trends"
 	"searchtrends/internal/config"
+	"searchtrends/internal/infra/memorystore"
 	"searchtrends/internal/metrics"
-	"searchtrends/internal/store"
-	"searchtrends/internal/transport/httpapi"
 )
 
 type Service struct {
-	store    *store.Store
-	consumer *broker.Consumer
+	store    *memorystore.Store
+	consumer *kafka.Consumer
 	http     *httpapi.Server
+	status   *kafka.Status
 	logger   *log.Logger
 }
 
 func New(cfg config.Config, logger *log.Logger) (*Service, error) {
 	collector := metrics.New()
-	st := store.New(store.Options{
-		Window:            5 * time.Minute,
-		MaxTop:            cfg.MaxTop,
-		RecomputeInterval: cfg.RecomputeInterval,
-		Metrics:           collector,
-		DedupWindow:       cfg.DedupWindow,
+	st := memorystore.New(memorystore.Options{
+		Window:       5 * time.Minute,
+		MaxTop:       cfg.MaxTop,
+		Metrics:      collector,
+		DedupWindow:  cfg.DedupWindow,
+		StopListFile: cfg.StopListFile,
 	})
+	service := trends.NewService(st)
+	status := &kafka.Status{}
+	consumer, err := kafka.NewConsumer(kafka.Config{
+		Brokers: cfg.KafkaBrokers,
+		Topic:   cfg.KafkaTopic,
+		GroupID: cfg.KafkaGroupID,
+		Logger:  logger,
+	}, service, collector, status)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Service{
-		store: st,
-		consumer: broker.NewConsumer(broker.Config{
-			URL:           cfg.NATSURL,
-			Subject:       cfg.NATSSubject,
-			Queue:         cfg.NATSQueue,
-			ClientName:    "searchtrends-consumer",
-			Logger:        logger,
-			ReconnectWait: cfg.ReconnectWait,
-		}, st, collector),
+		store:    st,
+		consumer: consumer,
 		http: httpapi.NewServer(httpapi.Options{
 			Addr:    cfg.HTTPAddr,
-			Store:   st,
+			Service: service,
 			Metrics: collector.Registry(),
 			Logger:  logger,
-			MaxTop:  cfg.MaxTop,
-			Window:  5 * time.Minute,
+			Ready:   status,
 		}),
+		status: status,
 		logger: logger,
 	}, nil
 }
@@ -70,6 +76,7 @@ func (s *Service) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		s.status.SetReady(false)
 		_ = s.http.Shutdown(shutdownCtx)
 		s.store.Close()
 		return ctx.Err()

@@ -1,6 +1,6 @@
-# Search Trends Service
+# Search Trends
 
-Сервис для тестового задания Wildberries Search: подписывается на поток поисковых событий, хранит скользящее окно последних 5 минут и отдаёт Top-N запросов через HTTP API.
+Сервис для виджета «Сейчас ищут». Читает поисковые события из Kafka и отдаёт Top-N запросов за последние 5 минут через HTTP API.
 
 ## Быстрый запуск
 
@@ -8,121 +8,115 @@
 docker compose up --build
 ```
 
-После старта доступны:
-
-- `GET http://localhost:8080/api/v1/top?n=10`
-- `POST http://localhost:8080/api/v1/stop-list`
-- `DELETE http://localhost:8080/api/v1/stop-list/{word}`
-- `GET http://localhost:8080/metrics`
-
-Пример публикации событий в NATS для локальной проверки:
+Проверка:
 
 ```bash
-go run ./cmd/publisher -count 50
+curl http://localhost:8080/health
+curl 'http://localhost:8080/api/v1/top?n=10'
 ```
 
-## API
-
-### Top-N
-
-`GET /api/v1/top?n=10`
-
-Ответ:
+Пример ответа:
 
 ```json
 {
   "window_seconds": 300,
   "limit": 10,
   "items": [
-    {"query": "iphone 15", "count": 18},
-    {"query": "laptop", "count": 11}
+    {"query": "iphone 15", "count": 2},
+    {"query": "sneakers", "count": 1}
   ]
 }
 ```
 
-### Стоп-лист
+## HTTP API
 
-Добавить слово:
+- `GET /health` — проверка сервиса.
+- `GET /readyz` — готовность Kafka consumer.
+- `GET /api/v1/top?n=10` — Top-N запросов за окно.
+- `GET /api/v1/stop-list` — текущий стоп-лист.
+- `POST /api/v1/stop-list` — добавить слово в стоп-лист.
+- `DELETE /api/v1/stop-list/{query}` — удалить слово из стоп-листа.
+- `GET /metrics` — Prometheus-метрики.
 
-```bash
-curl -X POST http://localhost:8080/api/v1/stop-list \
-  -H 'Content-Type: application/json' \
-  -d '{"word":"air fryer"}'
-```
+## Контракт события Kafka
 
-Удалить слово:
-
-```bash
-curl -X DELETE http://localhost:8080/api/v1/stop-list/air%20fryer
-```
-
-Просмотр стоп-листа:
-
-```bash
-curl http://localhost:8080/api/v1/stop-list
-```
-
-## Контракт события из брокера
-
-Сервис ожидает JSON со следующими полями:
+Топик по умолчанию: `search.events`.
 
 ```json
 {
-  "event_id": "evt-123",
   "query": "iphone 15",
-  "session_id": "session-42",
-  "user_id": "user-99",
-  "source": "search-service",
-  "occurred_at": "2026-05-25T12:00:00Z"
+  "user_id": "u123",
+  "request_id": "req-456",
+  "timestamp": "2026-05-22T12:00:00Z",
+  "source": "search-api"
 }
 ```
 
-Обязательные поля:
+Обязательное поле — `query`.
 
-- `event_id` нужен для идемпотентности на стороне продьюсера/брокера.
-- `query` нужен для агрегации топа.
-- `session_id` нужен для подавления искусственной накрутки повторными запросами в рамках одной сессии.
-- `occurred_at` нужен для корректного попадания события в 5-минутное окно.
-
-Необязательные поля:
-
-- `user_id` и `source` используются как расширение контракта для дальнейшей аналитики и расследования аномалий.
+Поддерживаются также `event_id` и `occurred_at`.
+Если `event_id` не передан, используется `request_id`.
+Если `occurred_at` нет, берётся `timestamp` или текущее время сервиса.
 
 ## Архитектура
 
-Для хранения топа используется in-memory sliding window на 300 секунд:
+- `cmd/...` — запуск приложения и graceful shutdown.
+- `internal/domain` — доменные типы и нормализация.
+- `internal/application/trends` — бизнес-логика и порты.
+- `internal/adapter/kafka` — Kafka consumer на `franz-go`.
+- `internal/adapter/httpapi` — HTTP-ручки.
+- `internal/infra/memorystore` — in-memory store со скользящим окном.
+- `internal/metrics` — Prometheus-метрики.
 
-- данные раскладываются по секундным бакетам;
-- у каждого бакета есть словарь `query -> count`;
-- при сдвиге окна старый бакет вычитается из агрегированных счётчиков;
-- HTTP API читает уже подготовленный snapshot, поэтому путь чтения не пересчитывает топ на лету.
+Почему in-memory: это быстрый вариант для этого сценария. Чтений здесь намного больше, чем записей, поэтому данные держатся в памяти, а Top кешируется snapshot-ом.
 
-Это даёт дешёвый read path, что важно, потому что запросов на чтение ожидается в 10-50 раз больше, чем входящих событий.
+## Защита от накруток
 
-Стоп-лист хранится в памяти и применяется при пересборке snapshot. Изменения доступны сразу через HTTP без перезапуска.
+- `MAX_QUERY_PER_BUCKET` — ограничение одинаковых запросов в одном бакете.
+- Дедупликация по `event_id` и `session_id+query`.
+- Динамический стоп-лист через API.
 
-## Антинакрутка
+## Конфигурация
 
-Реализовано подавление повторов по комбинации `session_id + normalized_query` в пределах окна. Это снижает эффект автоматических повторов одного и того же запроса из одной сессии.
+- `HTTP_ADDR` — адрес HTTP-сервера, по умолчанию `:8080`
+- `KAFKA_BROKERS` — брокеры Kafka, по умолчанию `localhost:9092`
+- `KAFKA_TOPIC` — топик, по умолчанию `search.events`
+- `KAFKA_GROUP_ID` — consumer group, по умолчанию `search-trends`
+- `WINDOW` — размер окна, по умолчанию `5m`
+- `BUCKET_RESOLUTION` — размер бакета, по умолчанию `1s`
+- `MAX_QUERY_PER_BUCKET` — лимит одинаковых запросов в бакет, по умолчанию `1000`
+- `STOPLIST_FILE` — файл стоп-листа, по умолчанию `stoplist.json`
 
-Это не полностью решает распределённые бот-атаки с множеством сессий, но хорошо покрывает частый практический кейс и не усложняет горячий путь чтения.
-
-## Trade-offs
-
-- Snapshot пересобирается асинхронно, поэтому между ingest и публикацией топа есть небольшая задержка, зато чтение остаётся очень дешёвым.
-- Дедупликация хранится в памяти и чистится по окну. Это упрощает реализацию, но не даёт персистентности после рестарта.
-- Брокер выбран NATS core для простоты локального запуска. Для более строгой надёжности можно заменить на JetStream или Kafka без изменения бизнес-логики.
-
-## Тесты и бенчмарк
-
-Запуск unit-тестов:
+## Локальная проверка
 
 ```bash
+go test ./internal/infra/memorystore -run Test
+go test ./internal/adapter/httpapi -run TestHTTPTopIntegration -v
 go test ./...
 ```
 
-Бенчмарк:
+## Производительность
+
+В проекте есть бенчмарки для хранилища:
 
 ```bash
-go test -bench=. ./internal/store
+go test -run=^$ -bench=. -benchmem -benchtime=2s ./internal/infra/memorystore
 ```
+
+## Скрипты
+
+- `scripts/produce.sh` — публикует тестовые события в Kafka.
+- `scripts/loadtest.sh` — публикует события и затем бьёт `/api/v1/top` через `hey`.
+
+Пример:
+
+```bash
+chmod +x scripts/*.sh
+./scripts/produce.sh 50000 100
+EVENTS=50000 UNIQUE=100 DURATION=60s CONCURRENCY=200 ./scripts/loadtest.sh
+```
+
+## Ограничения
+
+- Хранилище и стоп-лист живут в памяти; после рестарта данные окна теряются.
+- Антифрод здесь базовый: лимит по бакету и дедупликация. Для production это обычно расширяют.
